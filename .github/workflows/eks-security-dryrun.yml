@@ -2,13 +2,12 @@ name: eks-security-dryrun
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
 
 jobs:
   dryrun:
     runs-on: ubuntu-latest
-
     permissions:
       contents: read
 
@@ -20,33 +19,31 @@ jobs:
       - name: Sanity - no stray scaffold artifacts
         run: |
           set -euo pipefail
-          # 1) Literal "$@" lines
           if grep -R -n -E '^[[:space:]]*"\$@"[[:space:]]*$' .github terraform k8s tfvars; then
             echo "::error::Found stray '\"$@\"' line. Clean files and retry."
             exit 1
           fi
-          # 2) Bare double-quote lines
           if grep -R -n -E '^[[:space:]]*"[[:space:]]*$' .github terraform k8s tfvars; then
             echo "::error::Found stray bare '\"' line. Clean files and retry."
             exit 1
           fi
           echo "OK: no stray scaffold artifacts."
 
-      # Ensure tfvars exists so plan doesn't fail if file is missing
+      # Ensure tfvars exists (without heredoc to keep YAML simple)
       - name: Ensure tfvars/eks.tfvars exists (default for dry run)
         run: |
           set -euo pipefail
           mkdir -p tfvars
           if [ ! -f tfvars/eks.tfvars ]; then
-            cat > tfvars/eks.tfvars <<'EOF'
-project           = "eks-security"
-environment       = "dryrun"
-aws_region        = "us-east-1"
-name_prefix       = "ekssec"
-enable_eks        = true
-private_subnet_ids = ["subnet-aaaa1111", "subnet-bbbb2222"]
-cluster_role_arn   = "arn:aws:iam::111111111111:role/placeholder-eks-role"
-EOF
+            printf '%s\n' \
+'project           = "eks-security"' \
+'environment       = "dryrun"' \
+'aws_region        = "us-east-1"' \
+'name_prefix       = "ekssec"' \
+'enable_eks        = true' \
+'private_subnet_ids = ["subnet-aaaa1111", "subnet-bbbb2222"]' \
+'cluster_role_arn   = "arn:aws:iam::111111111111:role/placeholder-eks-role"' \
+> tfvars/eks.tfvars
             echo "Created default tfvars/eks.tfvars for dry run."
           fi
 
@@ -168,7 +165,6 @@ EOF
           grep -q "^kind: ClusterRole" k8s/manifests/rbac.yaml
           echo "OK: Required K8s objects present."
 
-      # === Artifacts ===
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
