@@ -1,0 +1,155 @@
+name: eks-security-dryrun
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+jobs:
+  dryrun:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Sanity — block stray scaffold artifacts that break parsers
+      - name: Sanity — no stray scaffold artifacts
+        run: |
+          set -euo pipefail
+          if grep -R -n -E '^[[:space:]]*"\$@"[[:space:]]*$' .github terraform k8s tfvars; then
+            echo "::error::Found stray '\"$@\"' line."
+            exit 1
+          fi
+          if grep -R -n -E '^[[:space:]]*"[[:space:]]*$' .github terraform k8s tfvars; then
+            echo "::error::Found stray bare '\"' line."
+            exit 1
+          fi
+          echo "OK: Sanity clean."
+
+      - name: Ensure jq
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Terraform fmt/validate
+        run: |
+          terraform -chdir=terraform init -backend=false
+          terraform -chdir=terraform fmt -recursive
+          terraform -chdir=terraform validate
+
+      - name: Terraform plan (no apply, no costs)
+        env:
+          AWS_ACCESS_KEY_ID: dummy
+          AWS_SECRET_ACCESS_KEY: dummy
+          AWS_REGION: us-east-1
+        run: |
+          set -euo pipefail
+          terraform -chdir=terraform init -backend=false
+          terraform -chdir=terraform plan -refresh=false \
+            -var-file=../tfvars/eks.tfvars \
+            -out=tfplan.binary
+          terraform -chdir=terraform show -json tfplan.binary > tfplan.json
+          terraform -chdir=terraform show tfplan.binary | sed -n "1,140p"
+
+      # EKS Security Gates from the Terraform plan
+      - name: Gate — EKS must have KMS secrets encryption
+        run: |
+          set -euo pipefail
+          HAS_ENC=$(jq -r '
+            any(.resource_changes[]?;
+                .type=="aws_eks_cluster" and
+                (.change.after.encryption_config // [] | length) > 0
+            )' tfplan.json)
+          if [ "$HAS_ENC" != "true" ]; then
+            echo "::error::EKS cluster lacks encryption_config (KMS)."
+            exit 1
+          fi
+          echo "OK: EKS encryption_config present."
+
+      - name: Gate — EKS endpoint must be private (no public access)
+        run: |
+          set -euo pipefail
+          PRIV=$(jq -r '
+            any(.resource_changes[]?;
+                .type=="aws_eks_cluster" and
+                ((.change.after.vpc_config | if type=="array" then .[0] else . end).endpoint_public_access == false)
+            )' tfplan.json)
+          if [ "$PRIV" != "true" ]; then
+            echo "::error::EKS endpoint_public_access must be false."
+            exit 1
+          fi
+          echo "OK: EKS private endpoint enforced."
+
+      - name: Gate — GuardDuty detector must be created
+        run: |
+          set -euo pipefail
+          HAS_GD=$(jq -r '
+            any(.resource_changes[]?; .type=="aws_guardduty_detector" and (.change.actions | index("create")))
+          ' tfplan.json)
+          if [ "$HAS_GD" != "true" ]; then
+            echo "::error::GuardDuty detector not present in plan."
+            exit 1
+          fi
+          echo "OK: GuardDuty detector present."
+
+      # Only enforce tags on resources that actually have tag fields
+      - name: Gate — required tags on taggable resources
+        run: |
+          set -euo pipefail
+          REQUIRED='["Project","Environment","Owner","CostCenter"]'
+          MISSING=$(
+            jq -r --argjson req "$REQUIRED" '
+              def ensure_obj(x): if (x|type)=="object" then x else {} end;
+              [
+                .resource_changes[]?
+                | select(.change.actions | index("create"))
+                | . as $rc
+                | (ensure_obj($rc.change.after)) as $after
+                | ($after.tags_all // $after.tags // null) as $tags
+                | select($tags != null)
+                | {addr: $rc.address, type: $rc.type,
+                   missing: [$req[] | select( ($tags[.] // null) == null )]}
+                | select(.missing | length > 0)
+                | "\(.addr) (\(.type)) missing: \(.missing|join(", "))"
+              ] | .[]
+            ' tfplan.json
+          )
+          if [ -n "$MISSING" ]; then
+            echo "::error::Missing required tags:"; echo "$MISSING"
+            exit 1
+          fi
+          echo "OK: required tags present on taggable resources."
+
+      # K8s policy checks (OPA/Rego) — no cluster required
+      - name: Conftest (OPA) — validate Kubernetes manifests
+        run: |
+          set -euo pipefail
+          test -d k8s/manifests
+          test -d k8s/policy
+          docker run --rm -v "$PWD/k8s:/project" openpolicyagent/conftest:latest test /project/manifests --policy /project/policy
+
+      - name: Quick static checks for required objects
+        run: |
+          set -euo pipefail
+          grep -q "pod-security.kubernetes.io/enforce: \"restricted\"" k8s/manifests/psa-namespaces.yaml
+          grep -q "kind: NetworkPolicy" k8s/manifests/networkpolicies.yaml
+          grep -q "kind: ClusterRole" k8s/manifests/rbac.yaml
+          echo "OK: Required K8s objects present."
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: eks-security-dryrun-artifacts
+          path: |
+            terraform/tfplan.binary
+            tfplan.json
+            k8s/manifests
+            k8s/policy
+          if-no-files-found: error
+
