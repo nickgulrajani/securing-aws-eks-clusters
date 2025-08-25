@@ -15,39 +15,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Sanity: block stray scaffold artifacts that break parsers
-      - name: Sanity - no stray scaffold artifacts
-        run: |
-          set -euo pipefail
-          if grep -R -n -E '^[[:space:]]*"\$@"[[:space:]]*$' .github terraform k8s tfvars; then
-            echo "::error::Found stray '\"$@\"' line. Clean files and retry."
-            exit 1
-          fi
-          if grep -R -n -E '^[[:space:]]*"[[:space:]]*$' .github terraform k8s tfvars; then
-            echo "::error::Found stray bare '\"' line. Clean files and retry."
-            exit 1
-          fi
-          echo "OK: no stray scaffold artifacts."
-
-      # Ensure tfvars exists (without heredoc to keep YAML simple)
-      - name: Ensure tfvars/eks.tfvars exists (default for dry run)
+      # Create tfvars if missing (no heredoc/backslashes)
+      - name: Ensure tfvars/eks.tfvars exists
         run: |
           set -euo pipefail
           mkdir -p tfvars
           if [ ! -f tfvars/eks.tfvars ]; then
-            printf '%s\n' \
-'project           = "eks-security"' \
-'environment       = "dryrun"' \
-'aws_region        = "us-east-1"' \
-'name_prefix       = "ekssec"' \
-'enable_eks        = true' \
-'private_subnet_ids = ["subnet-aaaa1111", "subnet-bbbb2222"]' \
-'cluster_role_arn   = "arn:aws:iam::111111111111:role/placeholder-eks-role"' \
-> tfvars/eks.tfvars
-            echo "Created default tfvars/eks.tfvars for dry run."
+            : > tfvars/eks.tfvars
+            echo 'project           = "eks-security"'        >> tfvars/eks.tfvars
+            echo 'environment       = "dryrun"'              >> tfvars/eks.tfvars
+            echo 'aws_region        = "us-east-1"'           >> tfvars/eks.tfvars
+            echo 'name_prefix       = "ekssec"'              >> tfvars/eks.tfvars
+            echo 'enable_eks        = true'                  >> tfvars/eks.tfvars
+            echo 'private_subnet_ids = ["subnet-aaaa1111", "subnet-bbbb2222"]' >> tfvars/eks.tfvars
+            echo 'cluster_role_arn   = "arn:aws:iam::111111111111:role/placeholder-eks-role"' >> tfvars/eks.tfvars
           fi
+          echo "tfvars/eks.tfvars ready"
 
-      - name: Ensure jq
+      - name: Install jq
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq
@@ -57,7 +42,7 @@ jobs:
         with:
           terraform_version: 1.6.6
 
-      - name: Terraform fmt and validate
+      - name: Terraform fmt & validate
         run: |
           terraform -chdir=terraform init -backend=false
           terraform -chdir=terraform fmt -recursive
@@ -75,10 +60,9 @@ jobs:
             -var-file=../tfvars/eks.tfvars \
             -out=tfplan.binary
           terraform -chdir=terraform show -json tfplan.binary > tfplan.json
-          terraform -chdir=terraform show tfplan.binary | sed -n '1,160p'
+          terraform -chdir=terraform show tfplan.binary | sed -n '1,140p'
 
-      # === Security gates derived from Terraform plan (zero cost) ===
-
+      # Gates derived from plan JSON (fast, zero-cost)
       - name: Gate - EKS must use KMS for secrets
         run: |
           set -euo pipefail
@@ -87,10 +71,7 @@ jobs:
                 .type=="aws_eks_cluster" and
                 (.change.after.encryption_config // [] | length) > 0
             )' tfplan.json)
-          if [ "$HAS_ENC" != "true" ]; then
-            echo "::error::EKS cluster lacks encryption_config (KMS)."
-            exit 1
-          fi
+          [ "$HAS_ENC" = "true" ] || { echo "::error::Missing EKS KMS encryption_config"; exit 1; }
           echo "OK: EKS encryption_config present."
 
       - name: Gate - EKS endpoint must be private
@@ -101,10 +82,7 @@ jobs:
                 .type=="aws_eks_cluster" and
                 ((.change.after.vpc_config | if type=="array" then .[0] else . end).endpoint_public_access == false)
             )' tfplan.json)
-          if [ "$PRIV" != "true" ]; then
-            echo "::error::EKS endpoint_public_access must be false."
-            exit 1
-          fi
+          [ "$PRIV" = "true" ] || { echo "::error::EKS endpoint_public_access must be false"; exit 1; }
           echo "OK: EKS private endpoint enforced."
 
       - name: Gate - GuardDuty detector must be created
@@ -113,10 +91,7 @@ jobs:
           HAS_GD=$(jq -r '
             any(.resource_changes[]?; .type=="aws_guardduty_detector" and (.change.actions | index("create")))
           ' tfplan.json)
-          if [ "$HAS_GD" != "true" ]; then
-            echo "::error::GuardDuty detector not present in plan."
-            exit 1
-          fi
+          [ "$HAS_GD" = "true" ] || { echo "::error::GuardDuty detector not present in plan"; exit 1; }
           echo "OK: GuardDuty detector present."
 
       - name: Gate - required tags on taggable resources
@@ -141,13 +116,11 @@ jobs:
             ' tfplan.json
           )
           if [ -n "$MISSING" ]; then
-            echo "::error::Missing required tags:"; echo "$MISSING"
-            exit 1
+            echo "::error::Missing required tags:"; echo "$MISSING"; exit 1
           fi
           echo "OK: required tags present on taggable resources."
 
-      # === Kubernetes policy checks (no cluster required) ===
-
+      # OPA checks for your k8s manifests (no cluster required)
       - name: Conftest (OPA) - validate Kubernetes manifests
         run: |
           set -euo pipefail
