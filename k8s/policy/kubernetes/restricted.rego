@@ -1,7 +1,6 @@
 package main
 
 # Deny messages are collected by conftest from the "deny" rule (a set of strings).
-# Rego v1 requires the "contains" and "if" keywords in rule heads.
 
 # --- Pod hardening ------------------------------------------------------------
 
@@ -62,7 +61,7 @@ deny contains msg if {
 
 # --- Helpers -----------------------------------------------------------------
 
-has_label(obj, key) {
+has_label(obj, key) if {
   obj.metadata.labels[key]
 }
 
