@@ -17,7 +17,7 @@ jobs:
         uses: actions/checkout@v4
 
       # Sanity: block stray scaffold artifacts that break parsers
-      - name: Sanity — no stray scaffold artifacts
+      - name: Sanity - no stray scaffold artifacts
         run: |
           set -euo pipefail
           # 1) Literal "$@" lines
@@ -60,7 +60,7 @@ EOF
         with:
           terraform_version: 1.6.6
 
-      - name: Terraform fmt & validate
+      - name: Terraform fmt and validate
         run: |
           terraform -chdir=terraform init -backend=false
           terraform -chdir=terraform fmt -recursive
@@ -80,9 +80,9 @@ EOF
           terraform -chdir=terraform show -json tfplan.binary > tfplan.json
           terraform -chdir=terraform show tfplan.binary | sed -n '1,160p'
 
-      # ==== Security Gates from the plan (fast, focused, zero cost) ====
+      # === Security gates derived from Terraform plan (zero cost) ===
 
-      - name: Gate — EKS must use KMS for secrets
+      - name: Gate - EKS must use KMS for secrets
         run: |
           set -euo pipefail
           HAS_ENC=$(jq -r '
@@ -96,7 +96,7 @@ EOF
           fi
           echo "OK: EKS encryption_config present."
 
-      - name: Gate — EKS endpoint must be private
+      - name: Gate - EKS endpoint must be private
         run: |
           set -euo pipefail
           PRIV=$(jq -r '
@@ -110,7 +110,7 @@ EOF
           fi
           echo "OK: EKS private endpoint enforced."
 
-      - name: Gate — GuardDuty detector must be created
+      - name: Gate - GuardDuty detector must be created
         run: |
           set -euo pipefail
           HAS_GD=$(jq -r '
@@ -122,7 +122,7 @@ EOF
           fi
           echo "OK: GuardDuty detector present."
 
-      - name: Gate — required tags on taggable resources
+      - name: Gate - required tags on taggable resources
         run: |
           set -euo pipefail
           REQUIRED='["Project","Environment","Owner","CostCenter"]'
@@ -149,9 +149,9 @@ EOF
           fi
           echo "OK: required tags present on taggable resources."
 
-      # ==== K8s policy checks (no cluster required) ====
+      # === Kubernetes policy checks (no cluster required) ===
 
-      - name: Conftest (OPA) — validate Kubernetes manifests
+      - name: Conftest (OPA) - validate Kubernetes manifests
         run: |
           set -euo pipefail
           test -d k8s/manifests
@@ -168,7 +168,7 @@ EOF
           grep -q "^kind: ClusterRole" k8s/manifests/rbac.yaml
           echo "OK: Required K8s objects present."
 
-      # ==== Artifacts ====
+      # === Artifacts ===
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
