@@ -9,23 +9,46 @@ jobs:
   dryrun:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Sanity — block stray scaffold artifacts that break parsers
+      # Sanity: block stray scaffold artifacts that break parsers
       - name: Sanity — no stray scaffold artifacts
         run: |
           set -euo pipefail
+          # 1) Literal "$@" lines
           if grep -R -n -E '^[[:space:]]*"\$@"[[:space:]]*$' .github terraform k8s tfvars; then
-            echo "::error::Found stray '\"$@\"' line."
+            echo "::error::Found stray '\"$@\"' line. Clean files and retry."
             exit 1
           fi
+          # 2) Bare double-quote lines
           if grep -R -n -E '^[[:space:]]*"[[:space:]]*$' .github terraform k8s tfvars; then
-            echo "::error::Found stray bare '\"' line."
+            echo "::error::Found stray bare '\"' line. Clean files and retry."
             exit 1
           fi
-          echo "OK: Sanity clean."
+          echo "OK: no stray scaffold artifacts."
+
+      # Ensure tfvars exists so plan doesn't fail if file is missing
+      - name: Ensure tfvars/eks.tfvars exists (default for dry run)
+        run: |
+          set -euo pipefail
+          mkdir -p tfvars
+          if [ ! -f tfvars/eks.tfvars ]; then
+            cat > tfvars/eks.tfvars <<'EOF'
+project           = "eks-security"
+environment       = "dryrun"
+aws_region        = "us-east-1"
+name_prefix       = "ekssec"
+enable_eks        = true
+private_subnet_ids = ["subnet-aaaa1111", "subnet-bbbb2222"]
+cluster_role_arn   = "arn:aws:iam::111111111111:role/placeholder-eks-role"
+EOF
+            echo "Created default tfvars/eks.tfvars for dry run."
+          fi
 
       - name: Ensure jq
         run: |
@@ -37,7 +60,7 @@ jobs:
         with:
           terraform_version: 1.6.6
 
-      - name: Terraform fmt/validate
+      - name: Terraform fmt & validate
         run: |
           terraform -chdir=terraform init -backend=false
           terraform -chdir=terraform fmt -recursive
@@ -55,10 +78,11 @@ jobs:
             -var-file=../tfvars/eks.tfvars \
             -out=tfplan.binary
           terraform -chdir=terraform show -json tfplan.binary > tfplan.json
-          terraform -chdir=terraform show tfplan.binary | sed -n "1,140p"
+          terraform -chdir=terraform show tfplan.binary | sed -n '1,160p'
 
-      # EKS Security Gates from the Terraform plan
-      - name: Gate — EKS must have KMS secrets encryption
+      # ==== Security Gates from the plan (fast, focused, zero cost) ====
+
+      - name: Gate — EKS must use KMS for secrets
         run: |
           set -euo pipefail
           HAS_ENC=$(jq -r '
@@ -72,7 +96,7 @@ jobs:
           fi
           echo "OK: EKS encryption_config present."
 
-      - name: Gate — EKS endpoint must be private (no public access)
+      - name: Gate — EKS endpoint must be private
         run: |
           set -euo pipefail
           PRIV=$(jq -r '
@@ -98,7 +122,6 @@ jobs:
           fi
           echo "OK: GuardDuty detector present."
 
-      # Only enforce tags on resources that actually have tag fields
       - name: Gate — required tags on taggable resources
         run: |
           set -euo pipefail
@@ -126,22 +149,26 @@ jobs:
           fi
           echo "OK: required tags present on taggable resources."
 
-      # K8s policy checks (OPA/Rego) — no cluster required
+      # ==== K8s policy checks (no cluster required) ====
+
       - name: Conftest (OPA) — validate Kubernetes manifests
         run: |
           set -euo pipefail
           test -d k8s/manifests
           test -d k8s/policy
-          docker run --rm -v "$PWD/k8s:/project" openpolicyagent/conftest:latest test /project/manifests --policy /project/policy
+          docker run --rm -v "$PWD/k8s:/project" openpolicyagent/conftest:latest \
+            test /project/manifests --policy /project/policy
+          echo "OK: OPA policy checks passed."
 
       - name: Quick static checks for required objects
         run: |
           set -euo pipefail
-          grep -q "pod-security.kubernetes.io/enforce: \"restricted\"" k8s/manifests/psa-namespaces.yaml
-          grep -q "kind: NetworkPolicy" k8s/manifests/networkpolicies.yaml
-          grep -q "kind: ClusterRole" k8s/manifests/rbac.yaml
+          grep -q 'pod-security.kubernetes.io/enforce: "restricted"' k8s/manifests/psa-namespaces.yaml
+          grep -q "^kind: NetworkPolicy" k8s/manifests/networkpolicies.yaml
+          grep -q "^kind: ClusterRole" k8s/manifests/rbac.yaml
           echo "OK: Required K8s objects present."
 
+      # ==== Artifacts ====
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -152,4 +179,3 @@ jobs:
             k8s/manifests
             k8s/policy
           if-no-files-found: error
-
